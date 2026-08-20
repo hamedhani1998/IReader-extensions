@@ -11,10 +11,13 @@ import ireader.core.source.model.Command
 import ireader.core.source.model.CommandList
 import ireader.core.source.model.Filter
 import ireader.core.source.model.FilterList
+import ireader.core.source.model.ImageUrl
 import ireader.core.source.model.MangaInfo
 import ireader.core.source.model.MangaInfo.Companion.COMPLETED
 import ireader.core.source.model.MangaInfo.Companion.ONGOING
 import ireader.core.source.model.MangasPageInfo
+import ireader.core.source.model.Page
+import ireader.core.source.model.Text
 import ireader.core.source.SourceFactory
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
@@ -23,6 +26,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.booleanOrNull
+import kotlin.time.Instant
 import tachiyomix.annotations.Extension
 import tachiyomix.annotations.GenerateTests
 import tachiyomix.annotations.TestExpectations
@@ -47,6 +51,7 @@ import tachiyomix.annotations.TestFixture
     supportsPagination = true,
     requiresLogin = false
 )
+@OptIn(kotlin.time.ExperimentalTime::class)
 abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
     deps = deps,
 ) {
@@ -81,8 +86,8 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
     override val exploreFetchers: List<BaseExploreFetcher>
         get() = listOf(
             BaseExploreFetcher(
-                "Recently Added",
-                endpoint = "/new/",
+                "الأكثر شهرة",
+                endpoint = "/popular/",
                 selector = "a.lib-card",
                 nameSelector = ".lib-card__title",
                 coverSelector = ".lib-card__img img",
@@ -93,8 +98,20 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
                 addBaseUrlToLink = true,
             ),
             BaseExploreFetcher(
-                "Library",
-                endpoint = "/library/",
+                "أحدث الفصول",
+                endpoint = "/",
+                selector = "article.latest-card",
+                nameSelector = "a.latest-title",
+                coverSelector = "a.latest-cover img",
+                coverAtt = "data-src",
+                addBaseurlToCoverLink = true,
+                linkSelector = "a.latest-title",
+                linkAtt = "href",
+                addBaseUrlToLink = true,
+            ),
+            BaseExploreFetcher(
+                "أضيف حديثاً",
+                endpoint = "/new/",
                 selector = "a.lib-card",
                 nameSelector = ".lib-card__title",
                 coverSelector = ".lib-card__img img",
@@ -145,7 +162,7 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
             nameSelector = ".ch-title",
             linkSelector = "a",
             linkAtt = "href",
-            reverseChapterList = true,  // Newest first, so reverse for reading order
+            reverseChapterList = false,
             addBaseUrlToLink = true,
         )
 
@@ -158,17 +175,44 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
     // CUSTOM API-BASED SEARCH
     // ═══════════════════════════════════════════════════════════════
     
+    private var cachedNonce: String? = null
+
+    private suspend fun getNonce(): String {
+        cachedNonce?.let { return it }
+        try {
+            val html = client.get(requestBuilder(baseUrl)).bodyAsText()
+            val theamAppStart = html.indexOf("THEAM_APP")
+            if (theamAppStart != -1) {
+                val nonceKey = "\"nonce\":\""
+                val nonceStart = html.indexOf(nonceKey, theamAppStart)
+                if (nonceStart != -1) {
+                    val nonceEnd = html.indexOf("\"", nonceStart + nonceKey.length)
+                    if (nonceEnd != -1) {
+                        cachedNonce = html.substring(nonceStart + nonceKey.length, nonceEnd)
+                        return cachedNonce!!
+                    }
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return ""
+    }
+
     /**
      * Custom search using MarkazRiwayat's JSON API
      * API endpoint: /wp-json/theam/v1/novel-search?term={query}&per_page=20
      */
     private suspend fun searchViaApi(query: String, perPage: Int = 20): MangasPageInfo {
-        // Encode the search query for URL
         val encodedQuery = query.encodeURLParameter()
         val apiUrl = "$baseUrl/wp-json/theam/v1/novel-search?term=$encodedQuery&per_page=$perPage"
         
-        // Fetch JSON response
-        val response = client.get(requestBuilder(apiUrl)).bodyAsText()
+        val request = requestBuilder(apiUrl)
+        val nonce = getNonce()
+        if (nonce.isNotBlank()) {
+            request.headers.append("X-WP-Nonce", nonce)
+        }
+        
+        val response = client.get(request).bodyAsText()
         val jsonObj = json.parseToJsonElement(response).jsonObject
         
         // Parse the items array
@@ -223,13 +267,13 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
     }
     
     /**
-     * Fetch chapters via API with pagination
-     * API endpoint: /wp-json/theam/v1/manga-chapters?manga_id={id}&order=DESC&page={page}&per_page=30
-     */
+      * Fetch chapters via API with pagination
+      * API endpoint: /wp-json/theam/v1/manga-chapters?manga_id={id}&order=DESC&page={page}&per_page=100
+      */
     private suspend fun fetchChaptersViaApi(
         mangaId: String,
         order: String = "DESC",
-        perPage: Int = 30
+        perPage: Int = 100
     ): List<ChapterInfo> {
         val allChapters = mutableListOf<ChapterInfo>()
         var currentPage = 1
@@ -242,7 +286,6 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
                 val response = client.get(requestBuilder(apiUrl)).bodyAsText()
                 val jsonObj = json.parseToJsonElement(response).jsonObject
                 
-                // Parse items array
                 val items = jsonObj["items"]?.jsonArray ?: emptyList()
                 
                 val pageChapters = items.mapNotNull { element ->
@@ -250,24 +293,27 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
                     
                     val label = item["label"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
                     val url = item["url"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-                    val num = item["num"]?.jsonPrimitive?.contentOrNull ?: ""
-                    val date = item["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val dateStr = item["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                    
+                    val dateUpload = try {
+                        Instant.parse(dateStr).toEpochMilliseconds()
+                    } catch (e: Exception) {
+                        0L
+                    }
                     
                     ChapterInfo(
                         name = label,
                         key = url,
-                        dateUpload = 0L // Could parse date if needed
+                        dateUpload = dateUpload
                     )
                 }
                 
                 allChapters.addAll(pageChapters)
                 
-                // Check if there are more pages
                 hasMore = jsonObj["has_more"]?.jsonPrimitive?.booleanOrNull == true
                 currentPage++
                 
             } catch (e: Exception) {
-                // If API fails, break the loop
                 hasMore = false
             }
         }
@@ -294,35 +340,61 @@ abstract class MarkazRiwayat(deps: Dependencies) : SourceFactory(
     /**
      * Override getChapterList to use API-based fetching
      * Priority:
-     * 1. WebView HTML (if Command.Chapter.Fetch is present)
-     * 2. API-based fetching (extract manga_id and fetch via API)
-     * 3. HTML-based fallback (default behavior)
+     * 1. API-based fetching (extract manga_id and fetch via API with pagination)
+     * 2. HTML-based fallback (default behavior)
      */
     override suspend fun getChapterList(
         manga: MangaInfo,
         commands: List<Command<*>>
     ): List<ChapterInfo> {
-        // Priority 1: Check for WebView HTML first
-        val chapterFetch = commands.findInstance<Command.Chapter.Fetch>()
-        if (chapterFetch != null && chapterFetch.html.isNotBlank()) {
-            return chaptersParse(chapterFetch.html.asJsoup()).reversed()
-        }
-
-        // Priority 2: Try API-based fetching
         try {
             val mangaId = extractMangaId(manga.key)
             if (mangaId != null) {
                 val chapters = fetchChaptersViaApi(mangaId)
                 if (chapters.isNotEmpty()) {
-                    // API returns in DESC order by default, so reverse for reading order
-                    return chapters.reversed()
+                    return chapters
                 }
             }
         } catch (e: Exception) {
-            // If API fails, fall through to HTML-based fetching
         }
 
-        // Priority 3: Fall back to default HTML-based fetching
         return super.getChapterList(manga, commands)
     }
+
+    override suspend fun getContents(chapter: ChapterInfo, commands: List<Command<*>>): List<Page> {
+        try {
+            val document = client.get(requestBuilder(chapter.key)).asJsoup()
+            val readingContent = document.selectFirst(".reading-content") ?: return emptyList()
+
+            readingContent.select(".theam-chobf").remove()
+
+            val pages = mutableListOf<Page>()
+
+            val paragraphs = readingContent.select("p")
+            for (p in paragraphs) {
+                val text = p.text()?.trim() ?: continue
+                if (text.isNotBlank() && text.length > 1) {
+                    pages.add(Text(text))
+                }
+            }
+
+            val images = readingContent.select("img")
+            for (img in images) {
+                val src = img.attr("src").takeIf { it.isNotBlank() }
+                    ?: img.attr("data-src").takeIf { it.isNotBlank() }
+                    ?: continue
+                pages.add(ImageUrl(src))
+            }
+
+            if (pages.isEmpty()) {
+                pages.add(Text(""))
+            }
+
+            return pages
+        } catch (e: Exception) {
+            return emptyList()
+        }
+    }
 }
+
+// force rebuild
