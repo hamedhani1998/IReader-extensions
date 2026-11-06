@@ -268,6 +268,12 @@ abstract class AzoraFly(private val deps: Dependencies) : SourceFactory(deps = d
      * under "content":[0,"..."].
      */
     private fun parseContentFromHtml(html: String): List<Page> {
+        // The site now renders the chapter directly in the HTML as
+        // .novel-reader-content (Tailwind "prose") instead of embedding it in
+        // the old Astro island props payload. Parse the visible reader block
+        // first, then keep the old Astro fallback for cached/older pages.
+        parseRenderedContent(html)?.let { return it }
+
         return try {
             val marker = "&quot;content&quot;:[0,&quot;"
             val start = html.indexOf(marker)
@@ -297,6 +303,26 @@ abstract class AzoraFly(private val deps: Dependencies) : SourceFactory(deps = d
         } catch (e: Exception) {
             Log.error { "Error parsing AzoraFly content: ${e.message}" }
             emptyList()
+        }
+    }
+
+    private fun parseRenderedContent(html: String): List<Page>? {
+        return try {
+            val doc = com.fleeksoft.ksoup.Ksoup.parse(html)
+            val content = doc.selectFirst(".novel-reader-content")
+                ?: doc.selectFirst("div.prose")
+                ?: return null
+
+            val paragraphs = content.select("p, h1, h2, h3, h4, blockquote")
+                .map { it.text().trim() }
+                .filter { it.isNotBlank() && it.length > 1 }
+                .distinct()
+
+            if (paragraphs.isEmpty()) return null
+            paragraphs.map { Text(it) }
+        } catch (e: Exception) {
+            Log.error { "Error parsing AzoraFly rendered content: ${e.message}" }
+            null
         }
     }
 
