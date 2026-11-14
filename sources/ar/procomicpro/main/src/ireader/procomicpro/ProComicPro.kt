@@ -1,9 +1,8 @@
 package ireader.procomicpro
 
-import com.fleeksoft.ksoup.Ksoup
-import com.fleeksoft.ksoup.nodes.Document
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.encodeURLParameter
 import ireader.core.log.Log
 import ireader.core.source.Dependencies
 import ireader.core.source.SourceFactory
@@ -15,29 +14,16 @@ import ireader.core.source.model.Filter
 import ireader.core.source.model.FilterList
 import ireader.core.source.model.ImageUrl
 import ireader.core.source.model.MangaInfo
-import ireader.core.source.model.MangaInfo.Companion.ONGOING
 import ireader.core.source.model.MangasPageInfo
 import ireader.core.source.model.Page
 import ireader.core.source.model.Text
+import kotlinx.serialization.json.Json
 import tachiyomix.annotations.AutoSourceId
 import tachiyomix.annotations.Extension
 import tachiyomix.annotations.GenerateTests
 import tachiyomix.annotations.TestExpectations
 import tachiyomix.annotations.TestFixture
 
-/**
- * ProComic Pro — procomic.pro (Arabic)
- *
- * Real site structure (verified):
- *  - Catalog:      https://procomic.pro/ar/series?sort=latest|popular&page=N
- *  - Novel filter: ?type=novels
- *  - Series page:  /ar/{slug}-{id}
- *  - Chapter page: /ar/chapter/{slug}-{chapterNumber}-{chapterId}
- *  - Chapters API: /api/chapters?seriesId=... (global feed, not usable per-series)
- *
- * This source parses the server-rendered HTML directly because the site is a
- * different structure from procomic.net.
- */
 @Extension
 @AutoSourceId(seed = "ProComicPro")
 @GenerateTests(
@@ -65,13 +51,15 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
     override val id: Long get() = ProComicProSourceId.ID
     override val name: String get() = "ProComic Pro"
 
-    private val typeOptions = arrayOf("الكل", "روايات", "مانجا", "مانهوا", "مانها")
-    private val typeValues = arrayOf("", "novels", "manga", "manhwa", "manhua")
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
 
     override fun getFilters(): FilterList = listOf(
         Filter.Title(),
-        Filter.Select("النوع", typeOptions),
-        Filter.Select("الترتيب", arrayOf("الأحدث", "الأكثر شعبية"))
+        Filter.Select("النوع", arrayOf("الكل", "روايات", "مانجا", "مانهوا", "مانها")),
+        Filter.Sort("الترتيب", arrayOf("الأحدث", "الأكثر شعبية"))
     )
 
     override fun getCommands(): CommandList = listOf(
@@ -80,44 +68,9 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
         Command.Content.Fetch(),
     )
 
-    override val exploreFetchers: List<BaseExploreFetcher>
-        get() = emptyList()
-
-    // The built-in fetchers are unused because every command is implemented
-    // through custom HTML parsing below.
-    override val detailFetcher: Detail
-        get() = SourceFactory.Detail(
-            nameSelector = "h1",
-            coverSelector = "img[src*='/series/'], img[src*='cdn'], img[src*='app.procomic']",
-            coverAtt = "src",
-            addBaseurlToCoverLink = true,
-            authorBookSelector = "a[href*='author'], a[href*='team']",
-            onAuthor = { it.trim() },
-            descriptionSelector = "h3:contains(نبذة) + p",
-            statusSelector = "h3:contains(الحالة) + p",
-            onStatus = { ONGOING },
-            categorySelector = "a[href*='genres'], a[href*='genre']"
-        )
-
-    override val chapterFetcher: Chapters
-        get() = SourceFactory.Chapters(
-            selector = "a[href*='/ar/chapter/']",
-            linkSelector = "a",
-            linkAtt = "href",
-            addBaseUrlToLink = true,
-            nameSelector = "span, div",
-            numberSelector = "span",
-            reverseChapterList = false
-        )
-
-    override val contentFetcher: Content
-        get() = SourceFactory.Content(
-            pageContentSelector = ".chapter-content p, .reading-content p, article p, main p"
-        )
-
-    // ══════════════════════════════════════════════════════════════════
-    // LIST / SEARCH
-    // ══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // LIST / SEARCH - using public JSON APIs
+    // ═══════════════════════════════════════════════════════════════
 
     override suspend fun getMangaList(filters: FilterList, page: Int): MangasPageInfo {
         val query = filters.findInstance<Filter.Title>()?.value?.takeIf { it.isNotBlank() }
@@ -126,104 +79,116 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
         val type = typeValues.getOrElse(typeIdx) { "" }
         val sort = if (sortIdx == 1) "popular" else "latest"
 
-        val catalogUrl = buildString {
-            append(baseUrl)
-            append("/ar/series?")
-            if (type.isNotEmpty()) {
-                append("type=")
-                append(type)
-                append('&')
-            }
-            append("sort=")
-            append(sort)
-        }
-
-        // Search: try the server-side search first, then fall back to filtering
-        // the catalog locally (the site search is client-side / unreliable).
+        // Try search first
         if (!query.isNullOrBlank()) {
-            val searchUrl = "$catalogUrl&search=${encode(query)}"
+            val searchUrl = buildString {
+                append(baseUrl)
+                append("/api/public/series/search?status=approved&limit=18&page=$page&sort=$sort")
+                if (type.isNotEmpty()) {
+                    append("&type=$type")
+                }
+                append("&search=${encode(query)}")
+            }
             val searched = parseListPage(searchUrl)
             if (searched.mangas.isNotEmpty()) return searched
-
-            val q = query.lowercase()
-            val catalog = parseListPage(catalogUrl)
-            val filtered = catalog.mangas.filter { it.title.lowercase().contains(q) }
-            return MangasPageInfo(mangas = filtered, hasNextPage = false)
         }
 
+        // Regular catalog
+        val catalogUrl = buildString {
+            append(baseUrl)
+            append("/api/public/series/search?status=approved&limit=18&page=$page&sort=$sort")
+            if (type.isNotEmpty()) {
+                append("&type=$type")
+            }
+        }
         return parseListPage(catalogUrl)
     }
 
-    /**
-     * Parses the server-rendered catalog page.
-     *
-     * NOTE: the site ignores the classic `?page=N` parameter (it paginates
-     * client-side), so only the first page is available. We therefore report
-     * `hasNextPage = false` to avoid returning the same page over and over.
-     */
     private suspend fun parseListPage(url: String): MangasPageInfo {
         return try {
-            val html = client.get(requestBuilder(url)).bodyAsText()
-            val doc: Document = Ksoup.parse(html)
-            val seen = mutableSetOf<String>()
+            val response = client.get(requestBuilder(url))
+            if (response.status.value >= 400) {
+                Log.error { "ProComicPro API error: ${response.status.value} for $url" }
+                return MangasPageInfo(emptyList(), false)
+            }
+            val jsonData = json.parseToJsonElement(response.bodyAsText())
+            val data = jsonData.jsonObject["data"]?.jsonArray ?: return MangasPageInfo(emptyList(), false)
+            val meta = jsonData.jsonObject["meta"]?.jsonObject
+            
             val items = mutableListOf<MangaInfo>()
+            data.forEach { item ->
+                val obj = item.jsonObject
+                val id = obj["id"]?.jsonPrimitive?.contentOrNull?.toLong() ?: return@forEach
+                val title = obj["title"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                val slug = obj["slug"]?.jsonPrimitive?.contentOrNull ?: ""
+                val description = obj["description"]?.jsonPrimitive?.contentOrNull
+                val type = obj["type"]?.jsonPrimitive?.contentOrNull
+                val status = obj["status"]?.jsonPrimitive?.contentOrNull
+                val thumbnail = obj["thumbnail"]?.jsonPrimitive?.contentOrNull
+                val coverImage = obj["coverImage"]?.jsonPrimitive?.contentOrNull
+                val cover = coverImage ?: thumbnail ?: ""
 
-            doc.select("a[href]").forEach { a ->
-                val href = a.attr("href")
-                val path = seriesPath(href) ?: return@forEach
-                val key = baseUrl + path
-                if (!seen.add(key)) return@forEach
+                // Build the series URL
+                val key = if (slug.isNotEmpty()) {
+                    "$baseUrl/ar/$slug-$id"
+                } else {
+                    "$baseUrl/ar/series-$id"
+                }
 
-                val title = a.selectFirst("h3")?.text()?.trim()?.ifBlank { null }
-                    ?: a.attr("title").trim().ifBlank { null }
-                if (title == null || title.length < 2) return@forEach
-
-                val img = a.selectFirst("img[src]")
-                    ?: a.selectFirst("img[data-src]")
-                val srcAttr = img?.attr("src").orEmpty()
-                val dataAttr = img?.attr("data-src").orEmpty()
-                val cover = srcAttr.ifBlank { dataAttr }
-
-                items.add(MangaInfo(key = key, title = title, cover = absImage(cover)))
+                items.add(MangaInfo(
+                    key = key,
+                    title = title,
+                    cover = absImage(cover),
+                    description = description,
+                    author = extractAuthorFromDescription(description),
+                    genres = extractGenresFromDescription(description),
+                    status = if (status == "approved") MangaInfo.Companion.ONGOING else MangaInfo.Companion.UNKNOWN
+                ))
             }
 
-            MangasPageInfo(mangas = items, hasNextPage = false)
+            val totalPages = meta?.["pages"]?.jsonPrimitive?.intOrNull ?: 1
+            val hasNextPage = page < totalPages
+
+            MangasPageInfo(items = items, hasNextPage = hasNextPage)
         } catch (e: Exception) {
             Log.error { "ProComicPro list error: ${e.message}" }
-            MangasPageInfo(mangas = emptyList(), hasNextPage = false)
+            MangasPageInfo(emptyList(), false)
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // DETAIL
-    // ══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // DETAIL - using content API
+    // ═══════════════════════════════════════════════════════════════
 
     override suspend fun getMangaDetails(manga: MangaInfo, commands: List<Command<*>>): MangaInfo {
         return try {
-            val html = client.get(requestBuilder(manga.key)).bodyAsText()
-            val doc: Document = Ksoup.parse(html)
+            // Try to extract ID from the URL
+            val url = manga.key
+            val id = url.substringAfterLast("/").toLongOrNull() ?: return manga
 
-            val title = doc.selectFirst("h1")?.text()?.trim()?.ifBlank { manga.title } ?: manga.title
-            val cover = doc.select("img[src]")
-                .map { it.attr("src").trim() }
-                .firstOrNull {
-                    it.contains("/series/") || it.contains("/series-cards") ||
-                        it.contains("cdn") || it.contains("app.procomic")
-                }
-                ?.let { absImage(it) }
-                ?: manga.cover
-
-            val description = extractDescription(doc) ?: manga.description
-            val author = extractAuthor(doc) ?: manga.author
-            val genres = extractGenres(doc)
+            val response = client.get(requestBuilder("$baseUrl/api/content/$id"))
+            if (response.status.value >= 400) {
+                return manga
+            }
+            
+            val jsonData = json.parseToJsonElement(response.bodyAsText()).jsonObject
+            val title = jsonData["title"]?.jsonPrimitive?.contentOrNull ?: manga.title
+            val description = jsonData["description"]?.jsonPrimitive?.contentOrNull ?: manga.description
+            val thumbnail = jsonData["thumbnail"]?.jsonPrimitive?.contentOrNull
+            val coverImage = jsonData["coverImage"]?.jsonPrimitive?.contentOrNull
+            val cover = coverImage ?: thumbnail ?: manga.cover
+            
+            val metadata = jsonData["metadata"]?.jsonObject
+            val author = metadata?.["author"]?.jsonPrimitive?.contentOrNull ?: extractAuthorFromDescription(description)
+            val genres = extractGenresFromMetadata(metadata)
 
             manga.copy(
                 title = title,
-                cover = cover,
+                cover = absImage(cover),
                 description = description,
                 author = author,
                 genres = if (genres.isNotEmpty()) genres else manga.genres,
-                status = ONGOING
+                status = MangaInfo.Companion.ONGOING
             )
         } catch (e: Exception) {
             Log.error { "ProComicPro detail error: ${e.message}" }
@@ -231,118 +196,132 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
         }
     }
 
-    private fun extractDescription(doc: Document): String? {
-        val text = doc.text()
-        val idx = text.indexOf("نبذة")
-        if (idx < 0) return null
-        var rest = text.substring(idx + "نبذة".length).trim()
-        val stops = listOf("عرض المزيد", "عرض أقل", "التصنيفات", "التصنيفات الفرعية", "الشعبية")
-        var end = rest.length
-        stops.forEach { stop ->
-            val i = rest.indexOf(stop)
-            if (i in 0 until end) end = i
-        }
-        rest = rest.substring(0, end).trim()
-        return rest.takeIf { it.length > 20 }
-    }
-
-    private fun extractAuthor(doc: Document): String? {
-        val text = doc.text()
-        val match = Regex("المؤلف\\s+(\\S+)").find(text) ?: return null
-        val candidate = match.groupValues.getOrNull(1)?.trim()
-        return candidate?.takeIf {
-            it.isNotBlank() && it.length in 2..60 &&
-                it !in setOf("العاملون", "عدد", "آخر", "المؤلف", "الرسام")
-        }
-    }
-
-    private fun extractGenres(doc: Document): List<String> {
-        val fromLinks = doc.select("a[href*='genres'], a[href*='genre']")
-            .map { it.text().trim() }
-            .filter { it.isNotBlank() && it.length < 30 }
-        return fromLinks.distinct()
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // CHAPTERS
-    // ══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // CHAPTERS - using public chapters API
+    // ═══════════════════════════════════════════════════════════════
 
     override suspend fun getChapterList(manga: MangaInfo, commands: List<Command<*>>): List<ChapterInfo> {
         return try {
-            val html = client.get(requestBuilder(manga.key)).bodyAsText()
-            val doc: Document = Ksoup.parse(html)
+            // Extract ID from manga URL
+            val id = manga.key.substringAfterLast("/").toLongOrNull() ?: return emptyList()
 
-            doc.select("a[href]").mapNotNull { a ->
-                val href = a.attr("href")
-                val path = chapterPath(href) ?: return@mapNotNull null
-                val name = a.text().trim().ifBlank { null } ?: return@mapNotNull null
-                if (!name.contains("الفصل")) return@mapNotNull null
-                ChapterInfo(name = name, key = baseUrl + path)
+            val chapters = mutableListOf<ChapterInfo>()
+            var page = 1
+            var hasMore = true
+
+            while (hasMore) {
+                val response = client.get(requestBuilder(
+                    "$baseUrl/api/public/chapters?contentId=$id&page=$page&limit=50"
+                ))
+                if (response.status.value >= 400) {
+                    hasMore = false
+                    break
+                }
+                
+                val jsonData = json.parseToJsonElement(response.bodyAsText()).jsonObject
+                val chapterArray = jsonData["chapters"]?.jsonArray ?: emptyList<JsonObject>()
+                val meta = jsonData["meta"]?.jsonObject
+                hasMore = meta?.["hasMore"]?.jsonPrimitive?.booleanOrNull ?: false
+
+                chapterArray.forEach { chapterJson ->
+                    val obj = chapterJson.jsonObject
+                    val chapterId = obj["id"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                    val chapterNumber = obj["chapter_number"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+                    val title = obj["title"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val language = obj["language"]?.jsonPrimitive?.contentOrNull?.lowercase() ?: "ar"
+
+                    // Build chapter URL
+                    val slug = manga.key.substringAfterLast("/").replace("-$id", "")
+                    val url = buildString {
+                        append("$baseUrl/")
+                        append(if (language == "ar") "ar" else "en")
+                        append("/chapter/$slug-$chapterNumber-$chapterId")
+                    }
+
+                    chapters.add(ChapterInfo(
+                        name = if (title.isNotBlank()) title else "الفصل $chapterNumber",
+                        key = url
+                    ))
+                }
+
+                page++
             }
-                .distinctBy { it.key }
-                .sortedWith(compareBy { chapterNumber(it.name) })
+
+            // Deduplicate by URL
+            chapters.distinctBy { it.key }.sortedWith(compareBy { chapterNumber(it.name) })
         } catch (e: Exception) {
             Log.error { "ProComicPro chapters error: ${e.message}" }
             emptyList()
         }
     }
 
-    private fun chapterNumber(name: String): Double {
-        val matches = Regex("\\d+(?:\\.\\d+)?").findAll(name).toList()
-        return matches.lastOrNull()?.value?.toDoubleOrNull() ?: 0.0
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // CONTENT
-    // ══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // CONTENT - handle locked/safe-browsing content
+    // ═══════════════════════════════════════════════════════════════
 
     override suspend fun getContents(chapter: ChapterInfo, commands: List<Command<*>>): List<Page> {
         return try {
-            val html = client.get(requestBuilder(chapter.key)).bodyAsText()
-            val doc: Document = Ksoup.parse(html)
-            val pages = mutableListOf<Page>()
+            val response = client.get(requestBuilder(chapter.key))
+            val html = response.bodyAsText()
 
-            // Manga / manhwa / manhua pages
-            doc.select("img[src], img[data-src]")
-                .mapNotNull { img ->
-                    val src = img.attr("src").ifBlank { img.attr("data-src") }.trim()
-                    src.takeIf { isContentImage(it) }
-                }
-                .distinct()
-                .forEach { pages.add(ImageUrl(absImage(it))) }
-
-            if (pages.isNotEmpty()) return pages
-
-            // Novel text
-            val container = sequenceOf(
-                ".chapter-content", ".reading-content", ".chapter-body",
-                "[class*=chapter-content]", "[class*=reading]", "article"
-            ).mapNotNull { doc.selectFirst(it) }.firstOrNull()
-
-            val paragraphs = container?.select("p") ?: doc.select("p")
-
-            paragraphs.forEach { p ->
-                val text = p.text().trim()
-                if (text.length > 1 && !isBoilerplate(text)) {
-                    pages.add(Text(text))
-                }
-            }
-
-            if (pages.isEmpty()) {
-                val locked = html.contains("افتح الفصل الآن") || html.contains("محتوى مميز")
-                pages.add(
+            // Check for locked content
+            if (html.contains("افتح الفصل الآن") || html.contains("محتوى مميز") || 
+                html.contains("التصفح الآمن مطلوب") || html.contains("safe-browsing")) {
+                return listOf(
                     Text(
-                        if (locked) "🔒 هذا الفصل مقفل على ProComic ويحتاج إلى فتح/عملات لقراءته."
-                        else "لا يوجد محتوى نصي متاح لهذا الفصل."
+                        "🔒 هذا الفصل مقفل على ProComic ويحتاج إلى فتح/عملات لقراءته."
                     )
                 )
             }
-            pages
+
+            // Try to extract images from the HTML
+            val pages = mutableListOf<Page>()
+            
+            // Pattern for images in chapter content
+            val imgRegex = "<img[^>]*src=[\"]([^\"]*)[\""][^>]*>".toRegex()
+            val matches = imgRegex.findAll(html)
+            
+            matches.forEach { match ->
+                val src = match.groupValues[1]
+                if (isContentImage(src)) {
+                    pages.add(ImageUrl(absImage(src)))
+                }
+            }
+
+            if (pages.isNotEmpty()) {
+                return pages
+            }
+
+            // If no images found, check for text content
+            val textRegex = "<p[^>]*>(.*?)</p>".toRegex(RegexOption.DOT_MATCHES_ALL)
+            val textMatches = textRegex.findAll(html)
+            val texts = mutableListOf<String>()
+            
+            textMatches.forEach { match ->
+                val text = match.groupValues[1].replace("\n", " ").trim()
+                if (text.length > 10 && !isBoilerplate(text)) {
+                    texts.add(text)
+                }
+            }
+
+            if (texts.isNotEmpty()) {
+                texts.take(50).forEach { text ->
+                    pages.add(Text(text))
+                }
+                return pages
+            }
+
+            // No content found
+            listOf(Text("لا يوجد محتوى نصي متاح لهذا الفصل."))
         } catch (e: Exception) {
             Log.error { "ProComicPro content error: ${e.message}" }
-            emptyList()
+            listOf(Text("خطأ في تحميل محتوى الفصل: ${e.message}"))
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════
 
     private fun isContentImage(src: String): Boolean {
         if (src.isBlank()) return false
@@ -364,62 +343,34 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
         return markers.any { text.contains(it, ignoreCase = true) }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // URL helpers
-    // ══════════════════════════════════════════════════════════════════
-
-    /** Returns the site-relative path for a series link, or null if it is not one. */
-    private fun seriesPath(href: String): String? {
-        val path = normalizePath(href) ?: return null
-        if (!path.startsWith("/ar/")) return null
-        if (path.contains("/chapter/")) return null
-        val excluded = listOf(
-            "/ar/series", "/ar/pages", "/ar/announcement", "/ar/notifications",
-            "/ar/team", "/ar/author", "/ar/library", "/ar/profile", "/ar/login",
-            "/ar/register", "/ar/search", "/ar/category"
-        )
-        if (excluded.any { path.startsWith(it) }) return null
-        val last = path.trimEnd('/').substringAfterLast('/')
-        if (!last.contains('-')) return null
-        val idPart = last.substringAfterLast('-')
-        if (idPart.isEmpty() || idPart.any { !it.isDigit() }) return null
-        return path
-    }
-
-    /** Returns the site-relative path for an Arabic chapter link, or null. */
-    private fun chapterPath(href: String): String? {
-        val path = normalizePath(href) ?: return null
-        if (!path.startsWith("/ar/chapter/")) return null
-        return path
-    }
-
-    /** Extracts a path from absolute/relative/protocol-relative URL, stripping query/fragment. */
-    private fun normalizePath(href: String): String? {
-        val h = href.trim()
-        if (h.isBlank()) return null
-        val raw = when {
-            h.startsWith("http://") || h.startsWith("https://") -> h
-            h.startsWith("//") -> "https:$h"
-            h.startsWith("/") -> h
-            else -> return null
-        }
-        val noQuery = raw.substringBefore('?').substringBefore('#')
-        return if (noQuery.startsWith("/")) {
-            noQuery
-        } else {
-            val schemeEnd = noQuery.indexOf("://")
-            if (schemeEnd < 0) return null
-            val slash = noQuery.indexOf('/', schemeEnd + 3)
-            if (slash < 0) return null
-            noQuery.substring(slash)
+    private fun extractAuthorFromDescription(description: String?): String? {
+        if (description.isNullOrBlank()) return null
+        val match = Regex("المؤلف\s+(\S+)").find(description) ?: return null
+        val candidate = match.groupValues.getOrNull(1)?.trim()
+        return candidate?.takeIf {
+            it.isNotBlank() && it.length in 2..60 &&
+                it !in setOf("العاملون", "عدد", "آخر", "المؤلف", "الرسام")
         }
     }
 
-    /** Rewrites any absolute link to this source's host and makes relative links absolute. */
-    private fun toAbsolute(href: String): String {
-        val h = href.trim()
-        val path = normalizePath(h) ?: return h
-        return baseUrl + path
+    private fun extractGenresFromDescription(description: String?): List<String> {
+        if (description.isNullOrBlank()) return emptyList()
+        return Regex("#([^#\s]+)").findAll(description)
+            .map { it.groupValues[1] }
+            .filter { it.isNotBlank() && it.length < 30 }
+            .distinct()
+    }
+
+    private fun extractGenresFromMetadata(metadata: JsonObject?): List<String> {
+        if (metadata == null) return emptyList()
+        val genres = metadata["genres"]?.jsonPrimitive?.contentOrNull ?: ""
+        if (genres.isBlank()) return emptyList()
+        return genres.split(",").map { it.trim() }.filter { it.isNotBlank() }
+    }
+
+    private fun chapterNumber(name: String): Double {
+        val matches = Regex("\\d+(?:\\.\\d+)?").findAll(name).toList()
+        return matches.lastOrNull()?.value?.toDoubleOrNull() ?: 0.0
     }
 
     private fun absImage(src: String): String {
@@ -427,7 +378,7 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
         return when {
             s.startsWith("http") -> s
             s.startsWith("//") -> "https:$s"
-            s.startsWith("/") -> baseUrl + s
+            s.startsWith("/") -> "$baseUrl$s"
             s.isBlank() -> ""
             else -> "$baseUrl/$s"
         }
@@ -435,4 +386,7 @@ abstract class ProComicPro(deps: Dependencies) : SourceFactory(deps = deps) {
 
     private fun encode(value: String): String =
         java.net.URLEncoder.encode(value, "UTF-8")
+
+    // Filter option values
+    private val typeValues = arrayOf("", "novels", "manga", "manhwa", "manhua")
 }
